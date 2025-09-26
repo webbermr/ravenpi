@@ -1,0 +1,13 @@
+# Lines starting with # are comments and will be ignored.
+# Format: Service/Country,StartAddress,EndAddress
+US Air Force,ADF000,ADFFFF
+US Air Force,AE0000,AE0FFF
+US Air Force,AE5000,AE6FFF
+US Navy & Marines,AE1000,AE3FFF
+US Navy & Marines,AE6600,AE68FF
+US Army,AE4A00,AE54FF
+US Coast Guard/DHS,AE4800,AE49FF
+NATO,3B7000,3B70FF
+NATO,48B000,48BFFF
+United Kingdom,43C000,43CFFF
+Canada,C20000,C2FFFF

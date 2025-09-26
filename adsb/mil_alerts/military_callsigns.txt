@@ -1,0 +1,18 @@
+# Lines starting with # are comments and will be ignored.
+REACH
+GUARD
+NAVY
+ARMY
+AIR FORCE
+COAST GUARD
+AF1
+AF2
+SAM
+PAT
+CNV
+RCH
+TOPCAT
+STONE
+VADER
+JEDI
+ROGUE
