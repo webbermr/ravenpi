@@ -51,6 +51,18 @@ ICAO_FILES = [
 CALLSIGNS_FILE = os.path.join(expanded_config_dir, 'military_callsigns.txt')
 LOG_FILE = os.path.join(expanded_config_dir, 'alert_log.csv')
 
+# --- Live aircraft lookup ---
+# When an alert fires we query hexdb.io for the aircraft's CURRENT registration,
+# owner and type. This keeps the alert accurate even when the static ICAO files
+# carry a stale label (aircraft get sold/re-registered over time).
+AIRCRAFT_DB_URL = "https://hexdb.io/api/v1/aircraft/"
+ENABLE_HEX_LOOKUP = True     # set False to disable live lookups entirely
+LOOKUP_TIMEOUT = 4           # seconds; short so a slow/down API can't stall the feed for long
+LOOKUP_CACHE_TTL = 86400     # re-query a given hex at most once per day
+
+# hex (uppercase) -> (fetched_at_epoch, info_dict_or_None)
+_aircraft_info_cache = {}
+
 # --- Dictionaries for TTS ---
 PHONETIC_ALPHABET = {
     'A': 'Alpha', 'B': 'Bravo', 'C': 'Charlie', 'D': 'Delta', 'E': 'Echo',
@@ -94,6 +106,8 @@ HTML_TEMPLATE = """
                 <th>Timestamp</th>
                 <th>Callsign</th>
                 <th>ICAO</th>
+                <th>Registration</th>
+                <th>Owner / Type</th>
                 <th>Service/Reason</th>
                 <th>Altitude</th>
                 <th>Speed</th>
@@ -107,6 +121,8 @@ HTML_TEMPLATE = """
                 <td>{{ alert.timestamp }}</td>
                 <td><b>{{ alert.callsign }}</b></td>
                 <td>{{ alert.icao }}</td>
+                <td>{{ alert.registration }}</td>
+                <td>{{ alert.owner }}{% if alert.owner and alert.actype %} &middot; {% endif %}{{ alert.actype }}</td>
                 <td>{{ alert.service }}</td>
                 <td>{{ alert.altitude }} ft</td>
                 <td>{{ alert.speed }} kts</td>
@@ -139,6 +155,8 @@ def speak_alert(data):
         full_cardinal_dir = CARDINAL_FULL_NAMES.get(short_dir, short_dir)
 
         service_reason = data['service']
+        owner = data.get('owner', '')
+        owner_part = f"registered to {owner}, " if owner else ""
 
         details_part = (
             f"has been detected flying at an altitude of {data['altitude']} feet, "
@@ -147,7 +165,7 @@ def speak_alert(data):
             f"{full_cardinal_dir} from your current location."
         )
 
-        full_sentence = f"Aircraft, {phonetic_callsign}, reason {service_reason}, {details_part}"
+        full_sentence = f"Aircraft, {phonetic_callsign}, {owner_part}reason {service_reason}, {details_part}"
         command = ['espeak-ng', '-a', '200', '-s', '150', full_sentence]
         
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -185,15 +203,15 @@ def update_location_from_gps():
             print(f"An error occurred with the GPS device: {e}")
         time.sleep(GPS_UPDATE_INTERVAL)
 
-def log_alert_to_csv(log_file, icao, callsign, service, lat, lon):
+def log_alert_to_csv(log_file, icao, callsign, service, lat, lon, registration="", owner=""):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    log_entry = [icao.upper(), callsign, service, timestamp, lat, lon]
+    log_entry = [icao.upper(), callsign, service, registration, owner, timestamp, lat, lon]
     file_exists = os.path.isfile(log_file)
     try:
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
             if not file_exists:
-                writer.writerow(['ICAO Address', 'Callsign', 'Service', 'Timestamp', 'Latitude', 'Longitude'])
+                writer.writerow(['ICAO Address', 'Callsign', 'Service', 'Registration', 'Owner', 'Timestamp', 'Latitude', 'Longitude'])
             writer.writerow(log_entry)
     except IOError as e:
         print(f"Warning: Could not write to log file '{log_file}'. Error: {e}")
@@ -268,6 +286,55 @@ def send_ntfy_alert(title, message, actions=None):
     except requests.exceptions.RequestException as e:
         print(f"Warning: Could not send ntfy notification. Error: {e}")
 
+def lookup_aircraft_info(icao):
+    """Look up an ICAO hex against hexdb.io for the CURRENT registration, owner
+    and type. Returns a dict (values may be empty strings) or None when the
+    aircraft isn't in the database (404) or the lookup fails. Results are cached
+    with a TTL so repeated alerts for the same hex don't re-hit the network, and
+    every failure path degrades gracefully to None so the alert still fires."""
+    if not ENABLE_HEX_LOOKUP:
+        return None
+    key = icao.strip().upper()
+    if not key:
+        return None
+    cached = _aircraft_info_cache.get(key)
+    if cached and (time.time() - cached[0] < LOOKUP_CACHE_TTL):
+        return cached[1]
+    info = None
+    try:
+        resp = requests.get(f"{AIRCRAFT_DB_URL}{key}", timeout=LOOKUP_TIMEOUT)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("Registration"):
+                info = {
+                    "registration": (data.get("Registration") or "").strip(),
+                    "owner": (data.get("RegisteredOwners") or "").strip(),
+                    "type": (data.get("Type") or "").strip(),
+                    "manufacturer": (data.get("Manufacturer") or "").strip(),
+                    "icao_type": (data.get("ICAOTypeCode") or "").strip(),
+                }
+        # 404 (unknown/covert/deregistered) leaves info as None.
+    except (requests.exceptions.RequestException, ValueError) as e:
+        print(f"Warning: aircraft lookup failed for {key}. Error: {e}")
+    _aircraft_info_cache[key] = (time.time(), info)
+    return info
+
+def format_identity(info):
+    """Render a lookup result as a one-line identity string, e.g.
+    'N212FX / 429 Global Ranger - Fairfax County Police Department'."""
+    if not info:
+        return ""
+    bits = []
+    if info.get("registration"):
+        bits.append(info["registration"])
+    type_str = info.get("type") or info.get("manufacturer")
+    if type_str:
+        bits.append(type_str)
+    line = " / ".join(bits)
+    if info.get("owner"):
+        line = f"{line} - {info['owner']}" if line else info["owner"]
+    return line
+
 def is_military_icao(icao, ranges_db):
     try:
         icao_int = int(icao, 16)
@@ -294,11 +361,21 @@ def generate_alert(aircraft_data, icao, service, is_test=False):
     display_pos, tts_pos_data = calculate_distance_and_bearing(aircraft_data['lat'], aircraft_data['lon'])
     map_link = f"https://globe.adsbexchange.com/?lat={aircraft_data['lat']}&lon={aircraft_data['lon']}&zoom=8&icao={icao.upper()}"
 
+    # --- Live lookup: current registration / owner / type for this hex ---
+    info = lookup_aircraft_info(icao)
+    identity = format_identity(info)
+    registration = info["registration"] if info else ""
+    owner = info["owner"] if info else ""
+    actype = (info.get("type") or info.get("manufacturer")) if info else ""
+
     # --- 1. Fast Alerts First ---
     alert_details = {
         "timestamp": datetime.now().strftime('%H:%M:%S'),
         "callsign": aircraft_data['callsign'],
         "icao": icao.upper(),
+        "registration": registration,
+        "owner": owner,
+        "actype": actype,
         "service": service,
         "altitude": aircraft_data['altitude'],
         "speed": aircraft_data['speed'],
@@ -312,6 +389,8 @@ def generate_alert(aircraft_data, icao, service, is_test=False):
     print(f"✈️  ALERT: Aircraft of Interest Detected! ✈️ ")
     print(f"  ICAO:      {icao.upper()} ({service})")
     print(f"  Callsign:  {aircraft_data['callsign']}")
+    if identity:
+        print(f"  Identity:  {identity}")
     print(f"  Position:  {display_pos}")
     print(f"  Altitude:  {aircraft_data['altitude']} ft | Speed: {aircraft_data['speed']} kts")
     print(f"  Map Link:  {map_link}")
@@ -322,13 +401,17 @@ def generate_alert(aircraft_data, icao, service, is_test=False):
         f"{aircraft_data['altitude']} ft | {aircraft_data['speed']} kts | {display_pos.split(',')[1].strip()}\n"
         f"ICAO: {icao.upper()} ({service})"
     )
+    if identity:
+        ntfy_message += f"\n{identity}"
     ntfy_actions = f"view, open, {map_link}"
     send_ntfy_alert(ntfy_title, ntfy_message, actions=ntfy_actions)
-    
-    log_alert_to_csv(LOG_FILE, icao, aircraft_data['callsign'], service, aircraft_data['lat'], aircraft_data['lon'])
-    
+
+    log_alert_to_csv(LOG_FILE, icao, aircraft_data['callsign'], service,
+                     aircraft_data['lat'], aircraft_data['lon'],
+                     registration=registration, owner=owner)
+
     # --- 2. Slow Alert Last ---
-    tts_alert_data = {**aircraft_data, **tts_pos_data, 'service': service}
+    tts_alert_data = {**aircraft_data, **tts_pos_data, 'service': service, 'owner': owner}
     speech_thread = Thread(target=speak_alert, args=(tts_alert_data,))
     speech_thread.start()
 
